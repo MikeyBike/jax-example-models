@@ -1,0 +1,52 @@
+[project]
+name = "jax-example-models"
+version = "0.1.0"
+description = "JAX translations of Stan example models following the JAX à la Stan methodology"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "BSD-3-Clause" }
+authors = [
+  { name = "Michael Issa", email = "michaelissa1879@gmail.com" }
+]
+keywords = ["bayesian", "jax", "stan", "probabilistic-programming", "mcmc"]
+
+dependencies = [
+    "jax[cuda12]>=0.4.30",
+    "blackjax>=1.3",
+    "arviz>=0.17.1",
+    "densejax>=0.0.1a0",
+    "numpy>=1.26.4",
+    "pandas>=2.3.0",
+    "matplotlib>=3.9.4",
+    "scipy>=1.13.1",
+    "jupyter>=1.0",
+    "nbformat>=5.0",
+    "oryx>=0.2.9",
+    "distrax>=0.1.7",
+]
+
+[project.optional-dependencies]
+cpu = ["jax[cpu]"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.15.4",
+    "mypy>=1.19.1",
+    "pre-commit>=4.3.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["jax_example_models"]
