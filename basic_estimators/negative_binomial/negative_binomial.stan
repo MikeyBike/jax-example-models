@@ -1,5 +1,6 @@
 data {
     int<lower=1> N;
+    array[N] int<lower=0> y;
 }
 
 parameters {
@@ -11,4 +12,11 @@ model {
     alpha ~ cauchy(0,10);
     beta ~ cauchy(0,10);
     y ~ neg_binomial(alpha, beta);
+}
+
+generated quantities {
+   array[N] int y_pred;
+   for (n in 1:N) {
+    y_pred[n] = neg_binomial_rng(alpha, beta);
+   }
 }
