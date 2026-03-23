@@ -36,7 +36,7 @@ def main():
 
             lp = tfd.HalfCauchy(loc=0.0, scale=10.0).log_prob(alpha)
             lp += tfd.HalfCauchy(loc=0.0, scale=10.0).log_prob(beta)
-            lp += jnp.sum(tfd.NegativeBinomial(total_count=alpha, probs=1.0 / (beta + 1.0)).log_prob(y))
+            lp += jnp.sum(tfd.NegativeBinomial(total_count=alpha, probs=1.0 / (beta + 1.0)).log_prob(y)) 
             lp += log_det_alpha + log_det_beta
             return lp
         
