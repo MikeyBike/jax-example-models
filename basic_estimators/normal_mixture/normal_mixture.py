@@ -31,14 +31,14 @@ def main():
         N = y.shape[0]
 
         def log_density(position):
-            theta_raw = position["theta_raw"]   
-            mu_raw = position["mu_raw"]         
+            theta_unc = position["theta_unc"]   
+            mu_unc = position["mu_unc"]         
 
-            theta = jax.nn.sigmoid(theta_raw)
-            mu1 = mu_raw[0]
-            mu2 = mu1 + jnp.exp(mu_raw[1])      
+            theta = jax.nn.sigmoid(theta_unc)
+            mu1 = mu_unc[0]
+            mu2 = mu1 + jnp.exp(mu_unc[1])      
 
-            log_det = (jnp.log(theta) + jnp.log1p(-theta)  + mu_raw[1])
+            log_det = (jnp.log(theta) + jnp.log1p(-theta)  + mu_unc[1])
 
             lp = tfd.Uniform(0.0, 1.0).log_prob(theta)
             lp += tfd.Normal(0.0, 10.0).log_prob(mu1)
@@ -53,11 +53,11 @@ def main():
             return lp
 
         def inv_transform(position):
-            theta_raw = position["theta_raw"]
-            mu_raw = position["mu_raw"]
-            theta = jax.nn.sigmoid(theta_raw)
-            mu1 = mu_raw[0]
-            mu2 = mu1 + jnp.exp(mu_raw[1])
+            theta_unc = position["theta_unc"]
+            mu_unc = position["mu_unc"]
+            theta = jax.nn.sigmoid(theta_unc)
+            mu1 = mu_unc[0]
+            mu2 = mu1 + jnp.exp(mu_unc[1])
             return {"theta": theta, "mu": jnp.stack([mu1, mu2])}
 
         def generate(rng, theta, mu):
@@ -70,8 +70,8 @@ def main():
         def initialize_random(rng):
             k1, k2 = jrd.split(rng)
             return {
-                "theta_raw": jrd.normal(k1, shape=()),
-                "mu_raw": jrd.normal(k2, shape=(2,)),
+                "theta_unc": jrd.normal(k1, shape=()),
+                "mu_unc": jrd.normal(k2, shape=(2,)),
             }
 
         return log_density, inv_transform, generate, initialize_random
