@@ -118,7 +118,7 @@ def main():
     print(f"{posterior_means=}")
     print(f"{posterior_stds=}")
 
-    # Posterior predictive checks
+    # Posterior predictive check
 
     def posterior_predictive_check(key, draws, generate_fn):
         S = draws["mu"].shape[0]
