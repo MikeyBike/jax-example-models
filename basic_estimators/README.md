@@ -2,6 +2,7 @@
 
 This is a running commentary on any significant model parameterization differences I encounter going through the process of translating the basic_estimator stan models into a particular Jax workflow. 
 
+
 ### `negative_binomial` and `negative_binomial2`
 
 **Stan**  
@@ -19,11 +20,7 @@ $$
 p^s (1 - p)^f
 $$
 
-To match the two parameterizations:
-$$
-\texttt{total\_count} = \alpha, \quad
-\texttt{probs} = \frac{1}{1 + \beta}
-$$
+To match the two parameterizations, set `total_count` $= \alpha$ and `probs` $= \dfrac{1}{1 + \beta}$.
 
 In this model, Stan defines:
 $$
