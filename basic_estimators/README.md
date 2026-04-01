@@ -7,30 +7,30 @@ This is a running commentary on any significant model parameterization differenc
 
 **Stan**  
 `neg_binomial(alpha, beta)` has PMF:
-$$
+```math
 \binom{n + \alpha - 1}{\alpha - 1}
 \left(\frac{\beta}{\beta + 1}\right)^\alpha
 \left(\frac{1}{\beta + 1}\right)^n
-$$
+```
 
 **TensorFlow Probability**  
 `NegativeBinomial(total_count, probs)` has PMF:
-$$
+```math
 \binom{s + f - 1}{s}
 p^s (1 - p)^f
-$$
+```
 
 To match the two parameterizations, set `total_count` $= \alpha$ and `probs` $= \dfrac{1}{1 + \beta}$.
 
 In this model, Stan defines:
-$$
+```math
 \beta = \frac{p_{\text{success}}}{1 - p_{\text{success}}}
-$$
+```
 
 Substituting:
-$$
+```math
 \texttt{probs} = \frac{1}{1 + \beta} = 1 - p_{\text{success}}
-$$
+```
 
 
 ### `normal_mixture_k`:
