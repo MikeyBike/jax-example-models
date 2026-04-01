@@ -2,7 +2,7 @@
 
 This is a running commentary on any significant model parameterization differences I encounter going through the process of translating the basic_estimator stan models into a particular Jax workflow. 
 
-### `negative_binomial` and `negative_binomial2`:
+### `negative_binomial` and `negative_binomial2`
 
 **Stan**  
 `neg_binomial(alpha, beta)` has PMF:
@@ -21,8 +21,8 @@ $$
 
 To match the two parameterizations:
 $$
-\text{total\_count} = \alpha, \quad
-\text{probs} = \frac{1}{1 + \beta}
+\texttt{total\_count} = \alpha, \quad
+\texttt{probs} = \frac{1}{1 + \beta}
 $$
 
 In this model, Stan defines:
@@ -32,8 +32,8 @@ $$
 
 Substituting:
 $$
-\text{probs} = \frac{1}{1 + \beta} = 1 - p_{\text{success}}
-$$ 
+\texttt{probs} = \frac{1}{1 + \beta} = 1 - p_{\text{success}}
+$$
 
 
 ### `normal_mixture_k`:
