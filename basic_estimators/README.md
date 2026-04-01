@@ -2,7 +2,7 @@
 
 This is a running commentary on any significant model parameterization differences I encounter going through the process of translating the basic_estimator stan models into a particular Jax workflow. 
 
-Relevant for `negative_binomial`;`negative_binomial2`:
+### `negative_binomial` and `negative_binomial2`:
 
 **Stan**  
 `neg_binomial(alpha, beta)` has PMF:
@@ -34,3 +34,19 @@ Substituting:
 $$
 \text{probs} = \frac{1}{1 + \beta} = 1 - p_{\text{success}}
 $$ 
+
+
+### `normal_mixture_k`:
+
+**Stan**  
+`simplex[K] theta` with no explicit prior uses Stan's internal stick-breaking transform, which is deliberately constructed so that a flat prior in unconstrained space induces a $\text{Dirichlet}(1, \ldots, 1)$ (uniform) prior on the simplex.
+
+**TFP**  
+`tfb.SoftmaxCentered()` maps $\mathbb{R}^{K-1} \to \Delta^K$ via $\text{softmax}([x;\, 0])$. A flat prior in unconstrained space induces a different, non-uniform distribution on the simplex because its Jacobian has a different structure.
+
+To match Stan's implicit prior, we add an explicit $\text{Dirichlet}(1, \ldots, 1)$ term in the JAX `log_density`:
+```python
+lp += tfd.Dirichlet(jnp.ones(K)).log_prob(theta)
+```
+
+This is added *after* the forward transform $\theta = f(\tilde{\theta})$, so $\theta \in \Delta^K$ is already in constrained space. The existing $\log \left|\det J_f(\tilde{\theta})\right|$ term correctly handles the change of variables — no double-counting occurs.
