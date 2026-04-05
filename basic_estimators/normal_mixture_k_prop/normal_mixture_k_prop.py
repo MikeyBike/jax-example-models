@@ -6,13 +6,10 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrd
 import blackjax
-import tensorflow_probability.substrates.jax as tfp
-
-tfd = tfp.distributions
-tfb = tfp.bijectors
-
+import tensorflow_probability.substrates.jax.bijectors as tfb
 
 def main():
+
     # Data
 
     script_dir = Path(__file__).resolve().parent
@@ -28,10 +25,8 @@ def main():
     # Model
 
     def normal_mixture_k_prop_model(y, K):
-
-        simplex_bij  = tfb.SoftmaxCentered()
-        mu_scale_bij = tfb.Softplus()
-        sigma_bij    = tfb.Softplus()
+        simplex_bij = tfb.SoftmaxCentered()
+        pos_bij     = tfb.Exp()
 
         def log_density(position):
             theta_unc    = position["theta_unc"]
@@ -40,30 +35,30 @@ def main():
             mu_scale_unc = position["mu_scale_unc"]
             sigma_unc    = position["sigma_unc"]
 
-            theta    = simplex_bij.forward(theta_unc)
-            mu_prop  = simplex_bij.forward(mu_prop_unc)
-            mu_scale = mu_scale_bij.forward(mu_scale_unc)
-            sigma    = sigma_bij.forward(sigma_unc)
+            theta        = simplex_bij.forward(theta_unc)
+            log_det_theta = simplex_bij.forward_log_det_jacobian(theta_unc, event_ndims=1)
+            
+            mu_prop      = simplex_bij.forward(mu_prop_unc)
+            log_det_mu_prop = simplex_bij.forward_log_det_jacobian(mu_prop_unc, event_ndims=1)
+            
+            mu_scale     = pos_bij.forward(mu_scale_unc)
+            log_det_mu_scale = pos_bij.forward_log_det_jacobian(mu_scale_unc, event_ndims=0)
+            
+            sigma        = pos_bij.forward(sigma_unc)
+            log_det_sigma = pos_bij.forward_log_det_jacobian(sigma_unc, event_ndims=1)
 
             mu = mu_loc + mu_scale * jnp.cumsum(mu_prop)
 
-            log_det_theta    = simplex_bij.forward_log_det_jacobian(theta_unc, event_ndims=1)
-            log_det_mu_prop  = simplex_bij.forward_log_det_jacobian(mu_prop_unc, event_ndims=1)
-            log_det_mu_scale = mu_scale_bij.forward_log_det_jacobian(mu_scale_unc, event_ndims=0)
-            log_det_sigma    = sigma_bij.forward_log_det_jacobian(sigma_unc, event_ndims=1)
+            def cauchy_lupdf(x, loc=0.0, scale=5.0):
+                return -jnp.log1p(jnp.square((x - loc) / scale))
 
-           
-            lp  = tfd.Dirichlet(jnp.ones(K)).log_prob(theta)
-            lp += tfd.Dirichlet(jnp.ones(K)).log_prob(mu_prop)
-            lp += tfd.Cauchy(0.0, 5.0).log_prob(mu_loc)
-            lp += tfd.HalfCauchy(0.0, 5.0).log_prob(mu_scale)
-            lp += tfd.HalfCauchy(0.0, 5.0).log_prob(sigma).sum()
+            lp  = cauchy_lupdf(mu_loc)
+            lp += cauchy_lupdf(mu_scale)
+            lp += jnp.sum(cauchy_lupdf(sigma))
 
+            norm_lupdf = -0.5 * jnp.square((y[:, None] - mu[None, :]) / sigma[None, :]) - jnp.log(sigma[None, :])
+            component_logps = jnp.log(theta)[None, :] + norm_lupdf
             
-            component_logps = (
-                jnp.log(theta)[None, :]
-                + tfd.Normal(mu[None, :], sigma[None, :]).log_prob(y[:, None])
-            )
             lp += jax.scipy.special.logsumexp(component_logps, axis=1).sum()
 
             lp += log_det_theta + log_det_mu_prop + log_det_mu_scale + log_det_sigma
@@ -74,10 +69,9 @@ def main():
             theta    = simplex_bij.forward(position["theta_unc"])
             mu_prop  = simplex_bij.forward(position["mu_prop_unc"])
             mu_loc   = position["mu_loc"]
-            mu_scale = mu_scale_bij.forward(position["mu_scale_unc"])
-            sigma    = sigma_bij.forward(position["sigma_unc"])
+            mu_scale = pos_bij.forward(position["mu_scale_unc"])
+            sigma    = pos_bij.forward(position["sigma_unc"])
             mu       = mu_loc + mu_scale * jnp.cumsum(mu_prop)
-
             return {
                 "theta":    theta,
                 "mu_prop":  mu_prop,
@@ -89,8 +83,9 @@ def main():
 
         def generate(rng, theta, mu, sigma):
             k1, k2 = jrd.split(rng)
-            components = tfd.Categorical(probs=theta).sample(seed=k1, sample_shape=(len(y),))
-            y_pred = tfd.Normal(mu[components], sigma[components]).sample(seed=k2)
+            N_obs = len(y)
+            components = jrd.categorical(k1, jnp.log(theta), shape=(N_obs,))
+            y_pred = mu[components] + sigma[components] * jrd.normal(k2, shape=(N_obs,))
             return {"y_pred": y_pred}
 
         def initialize_random(rng):
@@ -107,17 +102,13 @@ def main():
 
     log_density, inv_transform, generate, initialize_random = normal_mixture_k_prop_model(y, K)
 
-    # Random initialization
+    # Random init
 
     seed = 1234781938712
     key = jrd.key(seed)
     init_key, nuts_key, key = jrd.split(key, 3)
 
     t_params_init = initialize_random(init_key)
-    print(f"{t_params_init=}")
-    print(f"{inv_transform(t_params_init)=}")
-
-    # NUTS sampler
 
     def random_markov_chain(key, kernel, init_state, num_draws):
         @jax.jit
@@ -136,12 +127,11 @@ def main():
         kernel = blackjax.nuts(log_density, **params).step
         states = random_markov_chain(sample_key, kernel, state, num_draws)
         return states.position
-
+    
     # Posterior analysis
 
     num_draws = 1000
     t_draws = nuts_sample(nuts_key, log_density, t_params_init, num_draws)
-
     draws = jax.vmap(inv_transform)(t_draws)
 
     posterior_means = jax.tree.map(functools.partial(jnp.mean, axis=0), draws)
@@ -176,7 +166,6 @@ def main():
     posterior_predictive_stds  = jax.tree.map(functools.partial(jnp.std,  axis=0), pred_draws)
     print(f"\nPosterior predictive mean: {jnp.mean(posterior_predictive_means['y_pred']):.4f}")
     print(f"Posterior predictive std:  {jnp.mean(posterior_predictive_stds['y_pred']):.4f}")
-
 
 if __name__ == "__main__":
     main()
