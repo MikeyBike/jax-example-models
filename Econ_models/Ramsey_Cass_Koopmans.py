@@ -122,7 +122,65 @@ class RCK_model(eqx.Module):
 
         """
 
-        X_prev = jnp
+        X_prev = jnp.concatenate([X[:1], X[:-1]], axis=0)
+        X_next = jnp.concatenate([X[1:], X[-1:]], axis=0)
+        ts = jnp.arange(self.T)
+
+        jac_fn = jax.jacfwd(self._local_residual, argnums=(0, 1, 2))
+
+        def one_jac(args):
+            xp, xc, xn, t = args
+            j_prev, j_curr, j_next = jac_fn(xp, xc, xn, t)
+            j_prev, j_curr, j_next = jac_fn(xp, xc, xn, t)
+            return j_prev, j_curr, j_next
+        
+        A, B, C = jax.vmap(one_jac)((X_prev, X, X_next, ts))
+        return A, B, C
+
+    
+    @staticmethod
+    def solve_block_tridiagonal(A: jnp.ndarray, B: jnp.ndarray, C: jnp.ndarray, d: jnp.ndarray,) -> jnp.ndarray:
+        """Solve a block tridiagonal linear system.
+
+        System:
+            A_t x_{t-1} + B_t x_t + C_t x_{t+1} = d_t
+
+        with A_0 unused and C_{T-1} unused.
+
+        Args:
+        A, B, C : arrays of shape (T, m, m)
+        d       : array of shape (T, m)
+
+        Returns:
+        x : array of shape (T, m)
+        """
+        T = B.shape[0]
+        m = B.shape[1]
+
+        # Forward elimination
+        Bm = []
+        dm = []
+
+        Bm0 = B[0]
+        dm0 = d[0]
+        Bm.append(Bm0)
+        dm.append(dm0)
+
+        for t in range(1, T):
+            L_t = jax.scipy.linalg.solve(Bm[t - 1].T, A[t].T, assume_a="gen").T
+            B_t = B[t] - L_t @ C[t - 1]
+            d_t = d[t] - L_t @ dm[t - 1]
+            Bm.append(B_t)
+            dm.append(d_t)
+
+        # Back substitution.
+        x = [None] * T
+        x[T - 1] = jax.scipy.linalg.solve(Bm[T - 1], dm[T - 1], assume_a="gen")
+        for t in range(T - 2, -1, -1):
+            rhs = dm[t] - C[t] @ x[t + 1]
+            x[t] = jax.scipy.linalg.solve(Bm[t], rhs, assume_a="gen")
+
+        return jnp.stack(x, axis=0)
 
     
 
