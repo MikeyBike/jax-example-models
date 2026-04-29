@@ -58,6 +58,13 @@ class RCK_model(eqx.Module):
         """Capital per effective worker at the BGP"""
         num = (1.0 / self.beta) * (1.0 + self.n) * (1.0 + self.g) - (1.0 - self.delta)
         return float((num / self.alpha) ** (1.0 / (self.alpha - 1.0)))
+    
+    # Dynastic version, uncomment r3 too
+    # def k_star(self) -> float:
+    #     growth = (1.0 + self.n) * (1.0 + self.g)
+    #     num = self.alpha * growth ** (1.0 - self.alpha)
+    #     den = (1.0 + self.g) / self.beta - (1.0 - self.delta)
+    #     return float((num / den) ** (1.0 / (1.0 - self.alpha)))
 
     def bgp_values(self, A: float, L: float) -> Tuple[float, float, float, float]:
         """Aggregate BGP values at a given (A, L)"""
@@ -98,9 +105,11 @@ class RCK_model(eqx.Module):
 
         r1 = K_t - (1.0 - self.delta) * K_lag - I_t
         r2 = I_t + C_t - Y_t
-        r3 = 1.0 / C_t - self.beta / C_lead * (
-            self.alpha * Y_lead / K_t + 1.0 - self.delta
-        )
+        
+        r3 = 1.0 / C_t - self.beta / C_lead * (self.alpha * Y_lead / K_t + 1.0 - self.delta) 
+        """Uncomment k_star and r3 below to see the dynasty-weighted aggregate utility, which is more more patient when population grows (i.e. more saving, capital accumulation, and higher k_star)."""
+        # r3 = 1.0 / C_t - self.beta * (1.0 + self.n) / C_lead * (self.alpha * Y_lead / K_t + 1.0 - self.delta)  
+
         r4 = Y_t - K_lag ** self.alpha * (A_t * L_t) ** (1.0 - self.alpha)
 
         return jnp.array([r1, r2, r3, r4], dtype=jnp.float64)
