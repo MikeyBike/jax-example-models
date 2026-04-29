@@ -239,7 +239,7 @@ class RCK_model(eqx.Module):
         max_backtracks: int = 30,
         shrink: float = 0.5,
     ) -> Tuple[jnp.ndarray, float]:
-        """Backtracking line search on the max residual norm"""
+        
         step = 1.0
         X_best = X
         best_norm = current_norm
