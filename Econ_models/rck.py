@@ -1,19 +1,24 @@
 """Ramsey-Cass-Koopmans Perfect Foresight Model
 ================================================
-A JAX / Equinox implementation with a block-tridiagonal Newton solver.
-
-Basic economic setup is:
+Economic setup:
   - Cobb-Douglas production
   - Capital accumulation
   - Resource constraint
   - Euler equation
   - Perfect foresight transition path to the BGP
+
+Two utility specifications are supported via the `utility` field:
+  - "cass"     : objective is sum_t beta^t u(c_t)         (per-capita-only weighting)
+  - "dynastic" : objective is sum_t beta^t L_t u(c_t)     (population-weighted)
+
+Both use the same internal convention for k*: namely k = K / (A L (1+n)(1+g)),
+so that `bgp_values` is identical across utility modes. Only the Euler
+equation and the BGP fixed point differ.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -30,12 +35,74 @@ jax.config.update("jax_enable_x64", True)
 
 
 # -----------------------------------------------------------------------------
-# Model container
+# Block tridiagonal solve 
+# -----------------------------------------------------------------------------
+
+
+@jax.jit
+def solve_block_tridiagonal(
+    A: jnp.ndarray,
+    B: jnp.ndarray,
+    C: jnp.ndarray,
+    d: jnp.ndarray,
+) -> jnp.ndarray:
+    """Solve a block tridiagonal linear system using `lax.scan`.
+
+    System:
+        A_t x_{t-1} + B_t x_t + C_t x_{t+1} = d_t,
+    with A_0 unused and C_{T-1} unused.
+
+    Forward elimination yields modified diagonal blocks (Bm) and rhs (dm);
+    back substitution then walks the path from t = T-1 down to t = 0.
+
+    Args
+    ----
+    A, B, C : arrays of shape (T, m, m)
+    d       : array of shape (T, m)
+
+    Returns
+    -------
+    x : array of shape (T, m)
+    """
+    # Forward elimination
+    def fwd_step(carry, inp):
+        Bm_prev, dm_prev = carry
+        A_t, B_t, C_prev, d_t = inp
+        # L_t = A_t @ inv(Bm_prev), implemented via solve on the transpose
+        L_t = jax.scipy.linalg.solve(Bm_prev.T, A_t.T).T
+        Bm_t = B_t - L_t @ C_prev
+        dm_t = d_t - L_t @ dm_prev
+        return (Bm_t, dm_t), (Bm_t, dm_t)
+
+    init = (B[0], d[0])
+    fwd_inputs = (A[1:], B[1:], C[:-1], d[1:])
+    _, (Bm_tail, dm_tail) = jax.lax.scan(fwd_step, init, fwd_inputs)
+
+    Bm = jnp.concatenate([B[0:1], Bm_tail], axis=0)
+    dm = jnp.concatenate([d[0:1], dm_tail], axis=0)
+
+    # Back substitution
+    x_last = jax.scipy.linalg.solve(Bm[-1], dm[-1])
+
+    def bwd_step(x_next, inp):
+        Bm_t, dm_t, C_t = inp
+        rhs = dm_t - C_t @ x_next
+        x_t = jax.scipy.linalg.solve(Bm_t, rhs)
+        return x_t, x_t
+
+    bwd_inputs = (Bm[:-1], dm[:-1], C[:-1])
+    _, x_head = jax.lax.scan(bwd_step, x_last, bwd_inputs, reverse=True)
+
+    return jnp.concatenate([x_head, x_last[None]], axis=0)
+
+
+# -----------------------------------------------------------------------------
+# Model
 # -----------------------------------------------------------------------------
 
 
 class RCK_model(eqx.Module):
-    """Ramsey-Cass-Koopmans perfect-foresight transition model"""
+    """Ramsey-Cass-Koopmans perfect-foresight transition model."""
 
     alpha: float
     delta: float
@@ -43,6 +110,7 @@ class RCK_model(eqx.Module):
     n: float
     g: float
     T: int = eqx.field(static=True)
+    utility: str = eqx.field(static=True)
 
     A_path: jnp.ndarray
     L_path: jnp.ndarray
@@ -54,20 +122,27 @@ class RCK_model(eqx.Module):
     def growth_agg(self) -> float:
         return self.n + self.g + self.n * self.g
 
-    def k_star(self) -> float:
-        """Capital per effective worker at the BGP"""
-        num = (1.0 / self.beta) * (1.0 + self.n) * (1.0 + self.g) - (1.0 - self.delta)
-        return float((num / self.alpha) ** (1.0 / (self.alpha - 1.0)))
-    
-    # Dynastic version, uncomment r3 too
-    # def k_star(self) -> float:
-    #     growth = (1.0 + self.n) * (1.0 + self.g)
-    #     num = self.alpha * growth ** (1.0 - self.alpha)
-    #     den = (1.0 + self.g) / self.beta - (1.0 - self.delta)
-    #     return float((num / den) ** (1.0 / (1.0 - self.alpha)))
+    def k_star(self):
+        """Capital per (A L (1+n)(1+g)) at the BGP.
 
-    def bgp_values(self, A: float, L: float) -> Tuple[float, float, float, float]:
-        """Aggregate BGP values at a given (A, L)"""
+        In this convention K_t = A_t L_t (1+n)(1+g) k* at BGP, regardless
+        of the utility specification, so that `bgp_values` is invariant.
+        Only the implied k* differs between Cass and dynastic.
+        """
+        if self.utility == "cass":
+            # Aggregate Euler: 1/C = beta/C' (alpha y'/k + 1 - delta)
+            # => alpha k^{alpha-1} = (1+n)(1+g)/beta - (1-delta)
+            num = (1.0 / self.beta) * (1.0 + self.n) * (1.0 + self.g) - (1.0 - self.delta)
+        elif self.utility == "dynastic":
+            # Aggregate Euler: 1/C = beta (1+n) / C' (alpha y'/k + 1 - delta)
+            # => alpha k^{alpha-1} = (1+g)/beta - (1-delta)
+            num = (1.0 + self.g) / self.beta - (1.0 - self.delta)
+        else:
+            raise ValueError(f"Unknown utility kind: {self.utility!r}")
+        return float((num / self.alpha) ** (1.0 / (self.alpha - 1.0)))
+
+    def bgp_values(self, A: float, L: float):
+        """Aggregate BGP values at a given (A, L)."""
         k = self.k_star()
         K = A * L * (1.0 + self.n) * (1.0 + self.g) * k
         Klag = K / ((1.0 + self.n) * (1.0 + self.g))
@@ -80,6 +155,10 @@ class RCK_model(eqx.Module):
     # Residual blocks
     # ------------------------------------------------------------------
 
+    def _euler_factor(self) -> float:
+        """Aggregate-consumption Euler discount, depending on utility kind."""
+        return self.beta * (1.0 + self.n) if self.utility == "dynastic" else self.beta
+
     def local_residual(
         self,
         x_prev: jnp.ndarray,
@@ -87,15 +166,16 @@ class RCK_model(eqx.Module):
         x_next: jnp.ndarray,
         t: int,
     ) -> jnp.ndarray:
-        """Residual block at time t
+        """Residual block at time t.
 
-        Each x_t has shape (4,) with entries [C_t, K_t, Y_t, I_t]
+        Each x_t has shape (4,) with entries [C_t, K_t, Y_t, I_t].
+
+        Boundary handling:
+            K_{t-1} is fixed to K0 at t = 0
+            C_{t+1} and Y_{t+1} are fixed to terminal BGP values at t = T-1
         """
         C_t, K_t, Y_t, I_t = x_curr
 
-        # Boundary handling:
-        #   K_{t-1} is fixed to K0 at t=0
-        #   C_{t+1} and Y_{t+1} are fixed to terminal BGP values at t=T-1
         K_lag = jnp.where(t == 0, jnp.asarray(self.K0), x_prev[1])
         C_lead = jnp.where(t == self.T - 1, jnp.asarray(self.CTp1), x_next[0])
         Y_lead = jnp.where(t == self.T - 1, jnp.asarray(self.YTp1), x_next[2])
@@ -103,17 +183,16 @@ class RCK_model(eqx.Module):
         A_t = self.A_path[t]
         L_t = self.L_path[t]
 
+        ef = self._euler_factor()  # static-field branch, resolved at trace time
+
         r1 = K_t - (1.0 - self.delta) * K_lag - I_t
         r2 = I_t + C_t - Y_t
-        
-        r3 = 1.0 / C_t - self.beta / C_lead * (self.alpha * Y_lead / K_t + 1.0 - self.delta) 
-        """Uncomment k_star and r3 below to see the dynasty-weighted aggregate utility, which is more more patient when population grows (i.e. more saving, capital accumulation, and higher k_star)."""
-        # r3 = 1.0 / C_t - self.beta * (1.0 + self.n) / C_lead * (self.alpha * Y_lead / K_t + 1.0 - self.delta)  
-
+        r3 = 1.0 / C_t - ef / C_lead * (self.alpha * Y_lead / K_t + 1.0 - self.delta)
         r4 = Y_t - K_lag ** self.alpha * (A_t * L_t) ** (1.0 - self.alpha)
 
         return jnp.array([r1, r2, r3, r4], dtype=jnp.float64)
 
+    @eqx.filter_jit
     def residual_blocks(self, X: jnp.ndarray) -> jnp.ndarray:
         """Return residuals with shape (T, 4)."""
         X_prev = jnp.concatenate([X[:1], X[:-1]], axis=0)
@@ -124,26 +203,24 @@ class RCK_model(eqx.Module):
             xp, xc, xn, t = args
             return self.local_residual(xp, xc, xn, t)
 
-        return jax.vmap(one_residual)(
-            (X_prev, X, X_next, ts)
-        )
+        return jax.vmap(one_residual)((X_prev, X, X_next, ts))
 
     def residual_vector(self, x_flat: jnp.ndarray) -> jnp.ndarray:
         """Flattened residual vector of length 4T."""
         X = x_flat.reshape((self.T, 4))
         return self.residual_blocks(X).reshape((-1,))
 
+    @eqx.filter_jit
     def block_jacobians(
         self, X: jnp.ndarray
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Return the block tridiagonal Jacobian pieces
+        """Block-tridiagonal Jacobian pieces.
 
         A[t] = d r_t / d x_{t-1}
         B[t] = d r_t / d x_t
         C[t] = d r_t / d x_{t+1}
 
-        Shapes:
-          A, B, C: (T, 4, 4)
+        Shapes: A, B, C : (T, 4, 4)
         """
         X_prev = jnp.concatenate([X[:1], X[:-1]], axis=0)
         X_next = jnp.concatenate([X[1:], X[-1:]], axis=0)
@@ -153,107 +230,62 @@ class RCK_model(eqx.Module):
 
         def one_jac(args):
             xp, xc, xn, t = args
-            j_prev, j_curr, j_next = jac_fn(xp, xc, xn, t)
-            return j_prev, j_curr, j_next
+            return jac_fn(xp, xc, xn, t)
 
         A, B, C = jax.vmap(one_jac)((X_prev, X, X_next, ts))
         return A, B, C
 
     # ------------------------------------------------------------------
-    # Block tridiagonal solve
+    # Newton step, line search, full solve
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def solve_block_tridiagonal(
-        A: jnp.ndarray,
-        B: jnp.ndarray,
-        C: jnp.ndarray,
-        d: jnp.ndarray,
-    ) -> jnp.ndarray:
-        """Solve a block tridiagonal linear system
+    @eqx.filter_jit
+    def _residual_norm(self, X: jnp.ndarray) -> jnp.ndarray:
+        return jnp.max(jnp.abs(self.residual_blocks(X)))
 
-        System:
-            A_t x_{t-1} + B_t x_t + C_t x_{t+1} = d_t
-
-        with A_0 unused and C_{T-1} unused
-
-        Args
-        ----
-        A, B, C : arrays of shape (T, m, m)
-        d       : array of shape (T, m)
+    @eqx.filter_jit
+    def _newton_step(
+        self,
+        X: jnp.ndarray,
+        max_backtracks: int = 30,
+        shrink: float = 0.5,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """One full Newton iteration with backtracking line search.
 
         Returns
         -------
-        x : array of shape (T, m)
+        X_new       : updated iterate
+        norm_before : residual norm before this step
+        norm_after  : residual norm after the accepted step
         """
-        T = B.shape[0]
-        m = B.shape[1]
-
-        # Forward elimination.
-        Bm = []
-        dm = []
-
-        Bm0 = B[0]
-        dm0 = d[0]
-        Bm.append(Bm0)
-        dm.append(dm0)
-
-        for t in range(1, T):
-            # L_t = A_t @ inv(Bm[t-1])
-            L_t = jax.scipy.linalg.solve(Bm[t - 1].T, A[t].T, assume_a="gen").T
-            B_t = B[t] - L_t @ C[t - 1]
-            d_t = d[t] - L_t @ dm[t - 1]
-            Bm.append(B_t)
-            dm.append(d_t)
-
-        # Back substitution
-        x = [None] * T
-        x[T - 1] = jax.scipy.linalg.solve(Bm[T - 1], dm[T - 1], assume_a="gen")
-        for t in range(T - 2, -1, -1):
-            rhs = dm[t] - C[t] @ x[t + 1]
-            x[t] = jax.scipy.linalg.solve(Bm[t], rhs, assume_a="gen")
-
-        return jnp.stack(x, axis=0)
-
-    # ------------------------------------------------------------------
-    # Newton step and solver
-    # ------------------------------------------------------------------
-
-    def newton_direction(self, X: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Compute Newton direction dx and current residual blocks"""
         F = self.residual_blocks(X)
-        A, B, C = self.block_jacobians(X)
-        rhs = -F
-        dx = self.solve_block_tridiagonal(A, B, C, rhs)
-        return dx, F
+        norm_before = jnp.max(jnp.abs(F))
 
-    def _residual_norm(self, X: jnp.ndarray) -> jnp.ndarray:
-        F = self.residual_blocks(X)
-        return jnp.max(jnp.abs(F))
+        A, B, Cmat = self.block_jacobians(X)
+        dx = solve_block_tridiagonal(A, B, Cmat, -F)
 
-    def line_search(
-        self,
-        X: jnp.ndarray,
-        dx: jnp.ndarray,
-        current_norm: float,
-        max_backtracks: int = 30,
-        shrink: float = 0.5,
-    ) -> Tuple[jnp.ndarray, float]:
-        
-        step = 1.0
-        X_best = X
-        best_norm = current_norm
+        # Backtracking via lax.while_loop: accept the first step that
+        # strictly reduces the residual norm; fall back to X if none does.
+        def cond(state):
+            _, _, _, accepted, it = state
+            return jnp.logical_and(jnp.logical_not(accepted), it < max_backtracks)
 
-        for _ in range(max_backtracks):
+        def body(state):
+            step, X_best, best_norm, _, it = state
             X_cand = X + step * dx
-            cand_norm = float(self._residual_norm(X_cand))
-            if cand_norm < best_norm:
-                X_best = X_cand
-                best_norm = cand_norm
-                break
-            step *= shrink
+            cand_norm = jnp.max(jnp.abs(self.residual_blocks(X_cand)))
+            improved = cand_norm < norm_before
+            return (
+                step * shrink,
+                jnp.where(improved, X_cand, X_best),
+                jnp.where(improved, cand_norm, best_norm),
+                improved,
+                it + 1,
+            )
 
-        return X_best, best_norm
+        init = (jnp.float64(1.0), X, norm_before, jnp.bool_(False), jnp.int32(0))
+        _, X_new, norm_after, _, _ = jax.lax.while_loop(cond, body, init)
+        return X_new, norm_before, norm_after
 
     def solve(
         self,
@@ -262,35 +294,57 @@ class RCK_model(eqx.Module):
         max_iter: int = 60,
         verbose: bool = True,
     ) -> jnp.ndarray:
-        """Solve for the transition path using damped Newton iterations"""
-        _ = self.residual_blocks(X0).block_until_ready()
-        _ = self.block_jacobians(X0)
-
+        """Solve for the transition path using damped Newton iterations."""
         X = X0
         prev_step = 1.0
 
         if verbose:
-            header = f"{'Iter':>5}  {'max|F|':>12}  {'step':>8}"
+            header = f"{'Iter':>5}  {'max|F|':>12}  {'ratio':>8}"
             print(header)
             print("-" * len(header))
 
         for it in range(max_iter):
-            F = self.residual_blocks(X)
-            norm = float(jnp.max(jnp.abs(F)))
+            X, norm_before, norm_after = self._newton_step(X)
+            norm_before = float(norm_before)
+            norm_after = float(norm_after)
+
             if verbose:
-                print(f"{it:5d}  {norm:12.4e}  {prev_step:8.4f}")
-            if norm < tol:
+                print(f"{it:5d}  {norm_before:12.4e}  {prev_step:8.4f}")
+
+            if norm_before < tol:
                 if verbose:
                     print(f"\n✓ Converged in {it} iterations")
                 return X
 
-            dx, _ = self.newton_direction(X)
-            X, new_norm = self.line_search(X, dx, norm)
-            prev_step = float(jnp.nan_to_num(new_norm / norm, nan=0.0, posinf=0.0))
+            prev_step = float(np.nan_to_num(norm_after / norm_before, nan=0.0, posinf=0.0))
 
         if verbose:
-            print(f"\n Did not converge after {max_iter} iterations")
+            print(f"\n  Did not converge after {max_iter} iterations")
         return X
+
+    @eqx.filter_jit
+    def solve_jit(
+        self,
+        X0: jnp.ndarray,
+        tol: float = 1e-10,
+        max_iter: int = 60,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Fully jit-compiled solve, no diagnostic output.
+
+        Returns (X, final_norm, iterations_used)
+        """
+        def cond(state):
+            _, norm, it = state
+            return jnp.logical_and(norm > tol, it < max_iter)
+
+        def body(state):
+            X, _, it = state
+            X_new, _, norm_after = self._newton_step(X)
+            return (X_new, norm_after, it + 1)
+
+        init = (X0, jnp.float64(jnp.inf), jnp.int32(0))
+        X, norm, n_iter = jax.lax.while_loop(cond, body, init)
+        return X, norm, n_iter
 
 
 # -----------------------------------------------------------------------------
@@ -299,13 +353,13 @@ class RCK_model(eqx.Module):
 
 
 def growth_rate(X: np.ndarray, scale: Optional[np.ndarray] = None) -> np.ndarray:
-    """Period-over-period growth rate, optionally of X / scale"""
+    """Period-over-period growth rate, optionally of X / scale."""
     Xd = X if scale is None else X / scale
     return np.diff(Xd) / Xd[:-1]
 
 
 def build_initial_guess(model: RCK_model) -> jnp.ndarray:
-    """Construct a good initial guess that satisfies several equations exactly"""
+    """Construct an initial guess that satisfies several equations exactly."""
     T = model.T
 
     A_np = np.asarray(model.A_path)
@@ -326,7 +380,7 @@ def build_initial_guess(model: RCK_model) -> jnp.ndarray:
 
 
 def unpack_solution(model: RCK_model, X: jnp.ndarray):
-    """Return solution arrays with t=0 and terminal t=T+1 values included"""
+    """Return solution arrays with t = 0 and terminal t = T+1 values included."""
     T = model.T
 
     X_np = np.asarray(X)
@@ -355,6 +409,9 @@ def unpack_solution(model: RCK_model, X: jnp.ndarray):
     return t_full, C_full, K_full, Y_full, I_full, A_full, L_full
 
 
+# -----------------------------------------------------------------------------
+# Plot
+# -----------------------------------------------------------------------------
 
 
 def make_plot(
@@ -374,7 +431,7 @@ def make_plot(
     fig = plt.figure(figsize=(16, 13))
     fig.patch.set_facecolor("#F8FAFC")
     fig.suptitle(
-        "Ramsey-Cass-Koopmans — Transition to BGP  [JAX · Equinox · Block Newton]",
+        f"Ramsey-Cass-Koopmans — Transition to BGP  [{model.utility}, JAX · Equinox · Block Newton]",
         fontsize=13,
         fontweight="bold",
         y=0.99,
@@ -446,7 +503,9 @@ def make_plot(
     # (5) Capital stock
     ax5 = fig.add_subplot(gs[2, 1])
     ax5.plot(t_full, K_full, lw=2.2, color=PURP, label="K (solved)")
-    K_bgp_path = np.array([model.bgp_values((1.0 + model.g) ** t, (1.0 + model.n) ** t)[0] for t in t_full])
+    K_bgp_path = np.array(
+        [model.bgp_values((1.0 + model.g) ** t, (1.0 + model.n) ** t)[0] for t in t_full]
+    )
     ax5.plot(t_full, K_bgp_path, lw=1.5, color=GRAY, ls="--", alpha=0.7, label="BGP trajectory")
     ax5.fill_between(t_full, K_full, K_bgp_path, alpha=0.12, color=PURP, label="Gap to BGP")
     stylise(ax5, "Capital Stock vs. BGP Trajectory")
@@ -461,14 +520,7 @@ def make_plot(
     plt.close(fig)
 
 
-# -----------------------------------------------------------------------------
-# Main program
-# -----------------------------------------------------------------------------
-
-
 def main():
-
-
     # Parameters
     alpha = 0.3
     delta = 0.1
@@ -476,26 +528,21 @@ def main():
     n = 0.01
     g = 0.02
     T = 30
+    utility = "cass"   # or "dynastic"
 
     print(f"JAX version : {jax.__version__}")
     print(f"Backend     : {jax.default_backend()}")
-    print(f"Devices     : {jax.devices()}\n")
+    print(f"Devices     : {jax.devices()}")
+    print(f"Utility     : {utility}\n")
 
     # Balanced growth path setup
     A0, L0 = 1.0, 1.0
 
     tmp_model = RCK_model(
-        alpha=alpha,
-        delta=delta,
-        beta=beta,
-        n=n,
-        g=g,
-        T=T,
+        alpha=alpha, delta=delta, beta=beta, n=n, g=g, T=T, utility=utility,
         A_path=jnp.asarray((1.0 + g) ** np.arange(1, T + 1), dtype=jnp.float64),
         L_path=jnp.asarray((1.0 + n) ** np.arange(1, T + 1), dtype=jnp.float64),
-        K0=0.0,
-        CTp1=0.0,
-        YTp1=0.0,
+        K0=0.0, CTp1=0.0, YTp1=0.0,
     )
 
     K0_bgp, Y0_bgp, C0_bgp, I0_bgp = tmp_model.bgp_values(A0, L0)
@@ -506,17 +553,10 @@ def main():
     KTp1, YTp1, CTp1, ITp1 = tmp_model.bgp_values(ATp1, LTp1)
 
     model = RCK_model(
-        alpha=alpha,
-        delta=delta,
-        beta=beta,
-        n=n,
-        g=g,
-        T=T,
+        alpha=alpha, delta=delta, beta=beta, n=n, g=g, T=T, utility=utility,
         A_path=jnp.asarray((1.0 + g) ** np.arange(1, T + 1), dtype=jnp.float64),
         L_path=jnp.asarray((1.0 + n) ** np.arange(1, T + 1), dtype=jnp.float64),
-        K0=K0,
-        CTp1=CTp1,
-        YTp1=YTp1,
+        K0=K0, CTp1=CTp1, YTp1=YTp1,
     )
 
     print("=== BGP summary ===")
@@ -530,12 +570,22 @@ def main():
     # Initial guess
     X0 = build_initial_guess(model)
 
-    # Solve
-    print("Compiling residual and block-Jacobian paths...\n")
+    # Solve 
+    print("Compiling residual / Jacobian / block-solve paths...\n")
     t0 = time.perf_counter()
     X_sol = model.solve(X0, tol=1e-10, max_iter=60, verbose=True)
     elapsed = time.perf_counter() - t0
-    print(f"\nSolve time : {elapsed:.4f} s")
+    print(f"\nSolve time (verbose) : {elapsed:.4f} s")
+
+    # Cross-check against the fully-jitted version
+    t0 = time.perf_counter()
+    X_jit, norm_jit, niter_jit = model.solve_jit(X0, tol=1e-10, max_iter=60)
+    X_jit.block_until_ready()
+    elapsed_jit = time.perf_counter() - t0
+    print(f"Solve time (jit)     : {elapsed_jit:.4f} s   "
+          f"(final |F| = {float(norm_jit):.2e}, iters = {int(niter_jit)})")
+    max_disagreement = float(jnp.max(jnp.abs(X_sol - X_jit)))
+    print(f"max |X_verbose - X_jit| = {max_disagreement:.2e}")
 
     # Diagnostics
     F_sol = np.asarray(model.residual_blocks(X_sol))
@@ -560,7 +610,7 @@ def main():
     print(f"  gY_int  (last period): {gY_int[-1]:.6f}   (BGP: 0)")
 
     # Plot
-    output_path = Path(__file__).resolve().parent / "figs/rck"
+    output_path = Path(__file__).resolve().parent / f"figs/rck_{utility}.png"
     make_plot(model, t_full, C_full, K_full, Y_full, I_full, A_full, L_full, out_path=output_path)
     print(f"\nPlot file: {output_path}")
 
